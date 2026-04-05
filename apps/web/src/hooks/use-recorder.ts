@@ -2,6 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react"
 
 import { readChunkFromOpfs, saveChunkToOpfs } from "@/lib/opfs"
 import { getServerApiBase, uploadChunk } from "@/lib/chunk-upload"
+import {
+  getBrowserSpeechRecognitionCtor,
+  type BrowserSpeechRecognition,
+} from "@/lib/speech-recognition"
+import { requestTranscriptCleanup } from "@/lib/transcript-cleanup"
 import type { ChunkStatus, RecorderChunk, ServerAuditResponse } from "@/types/chunks"
 
 export type { RecorderChunk } from "@/types/chunks"
@@ -70,6 +75,14 @@ export interface UseRecorderOptions {
 
 export type RecorderStatus = "idle" | "requesting" | "recording" | "paused"
 
+export type TranscriptionStatus =
+  | "idle"
+  | "listening"
+  | "unsupported"
+  | "cleaning"
+  | "cleaned"
+  | "failed"
+
 export function useRecorder(options: UseRecorderOptions = {}) {
   const { chunkDuration = 5, deviceId } = options
 
@@ -78,6 +91,13 @@ export function useRecorder(options: UseRecorderOptions = {}) {
   const [elapsed, setElapsed] = useState(0)
   const [stream, setStream] = useState<MediaStream | null>(null)
   const [recordingId, setRecordingId] = useState(() => createRecordingId())
+
+  const [rawTranscript, setRawTranscript] = useState("")
+  const [interimTranscript, setInterimTranscript] = useState("")
+  const [cleanedTranscript, setCleanedTranscript] = useState("")
+  const [transcriptionStatus, setTranscriptionStatus] = useState<TranscriptionStatus>("idle")
+  const [transcriptionError, setTranscriptionError] = useState<string | undefined>()
+  const [transcriptCleanedAt, setTranscriptCleanedAt] = useState<string | undefined>()
 
   const streamRef = useRef<MediaStream | null>(null)
   const audioCtxRef = useRef<AudioContext | null>(null)
@@ -93,6 +113,11 @@ export function useRecorder(options: UseRecorderOptions = {}) {
   const pendingUploadsRef = useRef<RecorderChunk[]>([])
   const uploadingRef = useRef(false)
   const chunksRef = useRef<RecorderChunk[]>([])
+
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null)
+  const speechIntentRef = useRef<"off" | "listen" | "paused">("off")
+  const rawTranscriptRef = useRef("")
+  const interimTranscriptRef = useRef("")
 
   statusRef.current = status
   chunksRef.current = chunks
@@ -257,6 +282,85 @@ export function useRecorder(options: UseRecorderOptions = {}) {
     }
   }, [recordingId, updateChunkState])
 
+  const setupSpeechRecognition = useCallback(() => {
+    const Ctor = getBrowserSpeechRecognitionCtor()
+    if (!Ctor) {
+      speechIntentRef.current = "off"
+      setTranscriptionStatus("unsupported")
+      return
+    }
+
+    setTranscriptionStatus("listening")
+    setTranscriptionError(undefined)
+
+    const rec = new Ctor()
+    rec.continuous = true
+    rec.interimResults = true
+    rec.lang = "en-US"
+
+    rec.onresult = (event) => {
+      let interim = ""
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i]
+        const piece = result[0]?.transcript ?? ""
+        if (result.isFinal) {
+          const base = rawTranscriptRef.current
+          const next = `${base}${base && piece.trim() ? " " : ""}${piece}`.trim()
+          rawTranscriptRef.current = next
+          setRawTranscript(next)
+        } else {
+          interim += piece
+        }
+      }
+      interimTranscriptRef.current = interim
+      setInterimTranscript(interim)
+    }
+
+    rec.onerror = (ev) => {
+      if (ev.error === "aborted" || ev.error === "no-speech") {
+        return
+      }
+      setTranscriptionError(ev.error)
+      setTranscriptionStatus("failed")
+    }
+
+    rec.onend = () => {
+      if (speechIntentRef.current === "listen") {
+        try {
+          rec.start()
+        } catch {
+          // ignore duplicate start
+        }
+      } else if (speechIntentRef.current === "paused") {
+        return
+      } else {
+        const merged = [rawTranscriptRef.current, interimTranscriptRef.current]
+          .filter(Boolean)
+          .join(" ")
+          .trim()
+        rawTranscriptRef.current = merged
+        setRawTranscript(merged)
+        interimTranscriptRef.current = ""
+        setInterimTranscript("")
+        recognitionRef.current = null
+        setTranscriptionStatus((prev) =>
+          prev === "unsupported" || prev === "failed" ? prev : "idle"
+        )
+      }
+    }
+
+    recognitionRef.current = rec
+    try {
+      rec.start()
+    } catch (error) {
+      speechIntentRef.current = "off"
+      const message = error instanceof Error ? error.message : String(error)
+      setTranscriptionError(message)
+      setTranscriptionStatus("failed")
+      recognitionRef.current = null
+    }
+  }, [])
+
   const start = useCallback(async () => {
     if (statusRef.current === "recording") return
 
@@ -301,7 +405,18 @@ export function useRecorder(options: UseRecorderOptions = {}) {
       pausedElapsedRef.current = 0
       startTimeRef.current = Date.now()
       setElapsed(0)
+
+      setRawTranscript("")
+      setInterimTranscript("")
+      setCleanedTranscript("")
+      setTranscriptionError(undefined)
+      setTranscriptCleanedAt(undefined)
+      rawTranscriptRef.current = ""
+      interimTranscriptRef.current = ""
+
+      speechIntentRef.current = "listen"
       setStatus("recording")
+      setupSpeechRecognition()
 
       timerRef.current = setInterval(() => {
         if (statusRef.current === "recording") {
@@ -309,12 +424,16 @@ export function useRecorder(options: UseRecorderOptions = {}) {
         }
       }, 100)
     } catch {
+      speechIntentRef.current = "off"
       setStatus("idle")
     }
-  }, [chunkThreshold, deviceId, handleBufferedChunk, mergeBufferedSamples])
+  }, [chunkThreshold, deviceId, handleBufferedChunk, mergeBufferedSamples, setupSpeechRecognition])
 
   const stop = useCallback(() => {
     void flushChunk()
+
+    speechIntentRef.current = "off"
+    recognitionRef.current?.stop()
 
     processorRef.current?.disconnect()
     streamRef.current?.getTracks().forEach((t) => t.stop())
@@ -332,17 +451,54 @@ export function useRecorder(options: UseRecorderOptions = {}) {
 
   const pause = useCallback(() => {
     if (statusRef.current !== "recording") return
+    speechIntentRef.current = "paused"
+    recognitionRef.current?.stop()
     pausedElapsedRef.current += (Date.now() - startTimeRef.current) / 1000
     setStatus("paused")
   }, [])
 
   const resume = useCallback(() => {
     if (statusRef.current !== "paused") return
+    speechIntentRef.current = "listen"
+    try {
+      recognitionRef.current?.start()
+    } catch {
+      // ignore
+    }
     startTimeRef.current = Date.now()
     setStatus("recording")
   }, [])
 
+  const cleanTranscript = useCallback(async () => {
+    const text = [rawTranscriptRef.current, interimTranscriptRef.current]
+      .filter(Boolean)
+      .join(" ")
+      .trim()
+    if (!text) {
+      setTranscriptionError("Nothing to clean yet.")
+      setTranscriptionStatus("failed")
+      return
+    }
+
+    setTranscriptionStatus("cleaning")
+    setTranscriptionError(undefined)
+    try {
+      const cleaned = await requestTranscriptCleanup(text)
+      setCleanedTranscript(cleaned)
+      setTranscriptCleanedAt(new Date().toISOString())
+      setTranscriptionStatus("cleaned")
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setTranscriptionError(message)
+      setTranscriptionStatus("failed")
+    }
+  }, [])
+
   const clearChunks = useCallback(() => {
+    speechIntentRef.current = "off"
+    recognitionRef.current?.abort()
+    recognitionRef.current = null
+
     for (const chunk of chunks) {
       URL.revokeObjectURL(chunk.url)
     }
@@ -351,10 +507,22 @@ export function useRecorder(options: UseRecorderOptions = {}) {
     pendingUploadsRef.current = []
     uploadingRef.current = false
     setRecordingId(createRecordingId())
+
+    setRawTranscript("")
+    setInterimTranscript("")
+    setCleanedTranscript("")
+    setTranscriptionStatus("idle")
+    setTranscriptionError(undefined)
+    setTranscriptCleanedAt(undefined)
+    rawTranscriptRef.current = ""
+    interimTranscriptRef.current = ""
   }, [chunks])
 
   useEffect(() => {
     return () => {
+      speechIntentRef.current = "off"
+      recognitionRef.current?.abort()
+      recognitionRef.current = null
       processorRef.current?.disconnect()
       streamRef.current?.getTracks().forEach((t) => t.stop())
       if (audioCtxRef.current?.state !== "closed") {
@@ -376,5 +544,12 @@ export function useRecorder(options: UseRecorderOptions = {}) {
     clearChunks,
     recordingId,
     reconcileRecording,
+    rawTranscript,
+    interimTranscript,
+    cleanedTranscript,
+    transcriptionStatus,
+    transcriptionError,
+    transcriptCleanedAt,
+    cleanTranscript,
   }
 }

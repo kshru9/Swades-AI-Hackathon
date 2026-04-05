@@ -8,6 +8,7 @@ import { logger } from "hono/logger";
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
 
+import { cleanTranscriptWithDeepseek } from "./deepseek-cleanup";
 import { objectExistsInBucket, uploadChunk } from "./storage";
 
 const app = new Hono();
@@ -242,6 +243,49 @@ app.get("/api/chunks/recordings/:recordingId/audit", async (c) => {
     recordingId,
     chunks,
   });
+});
+
+/** Text-only cleanup via DeepSeek (no audio). */
+app.post("/api/transcription/cleanup", async (c) => {
+  if (!env.DEEPSEEK_API_KEY) {
+    return c.json(errorResponse("DeepSeek is not configured (set DEEPSEEK_API_KEY)"), 503);
+  }
+
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json(errorResponse("invalid json"), 400);
+  }
+
+  const text =
+    typeof body === "object" &&
+    body !== null &&
+    "text" in body &&
+    typeof (body as { text: unknown }).text === "string"
+      ? (body as { text: string }).text.trim()
+      : "";
+
+  if (!text) {
+    return c.json(errorResponse("text is required and must be non-empty"), 400);
+  }
+
+  if (text.length > 100_000) {
+    return c.json(errorResponse("text exceeds maximum length"), 400);
+  }
+
+  try {
+    const cleanedText = await cleanTranscriptWithDeepseek(text);
+    return c.json({ ok: true, cleanedText });
+  } catch (error) {
+    return c.json(
+      errorResponse(
+        "cleanup failed",
+        error instanceof Error ? error.message : String(error),
+      ),
+      502,
+    );
+  }
 });
 
 if (import.meta.main) {

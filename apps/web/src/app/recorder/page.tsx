@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useRef, useState } from "react"
-import { Download, Mic, Pause, Play, Square, Trash2 } from "lucide-react"
+import { Copy, Download, Mic, Pause, Play, Square, Trash2 } from "lucide-react"
 
 import { Button } from "@my-better-t-app/ui/components/button"
 import {
@@ -95,6 +95,7 @@ export default function RecorderPage() {
   const [deviceId] = useState<string | undefined>()
   const [isReconciling, setIsReconciling] = useState(false)
   const [reconcileMessage, setReconcileMessage] = useState<string | null>(null)
+  const [copyHint, setCopyHint] = useState<string | null>(null)
   const {
     status,
     start,
@@ -107,6 +108,13 @@ export default function RecorderPage() {
     clearChunks,
     recordingId,
     reconcileRecording,
+    rawTranscript,
+    interimTranscript,
+    cleanedTranscript,
+    transcriptionStatus,
+    transcriptionError,
+    transcriptCleanedAt,
+    cleanTranscript,
   } = useRecorder({ chunkDuration: 5, deviceId })
 
   const handleReconcile = useCallback(async () => {
@@ -123,6 +131,33 @@ export default function RecorderPage() {
     }
   }, [reconcileRecording])
 
+  const handleCleanTranscript = useCallback(async () => {
+    await cleanTranscript()
+  }, [cleanTranscript])
+
+  const copyCombinedTranscript = useCallback(async () => {
+    const text = [rawTranscript, interimTranscript].filter(Boolean).join(" ").trim()
+    if (!text) return
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopyHint("Copied raw + interim")
+    } catch {
+      setCopyHint("Copy failed")
+    }
+    setTimeout(() => setCopyHint(null), 2000)
+  }, [interimTranscript, rawTranscript])
+
+  const copyCleaned = useCallback(async () => {
+    if (!cleanedTranscript) return
+    try {
+      await navigator.clipboard.writeText(cleanedTranscript)
+      setCopyHint("Copied cleaned")
+    } catch {
+      setCopyHint("Copy failed")
+    }
+    setTimeout(() => setCopyHint(null), 2000)
+  }, [cleanedTranscript])
+
   const isRecording = status === "recording"
   const isPaused = status === "paused"
   const isActive = isRecording || isPaused
@@ -135,16 +170,30 @@ export default function RecorderPage() {
     }
   }, [isActive, stop, start])
 
+  const isCleaning = transcriptionStatus === "cleaning"
+
   return (
-    <div className="container mx-auto flex max-w-lg flex-col items-center gap-6 px-4 py-8">
+    <div className="container mx-auto flex max-w-2xl flex-col items-center gap-6 px-4 py-8">
       <Card className="w-full">
         <CardHeader>
           <CardTitle>Recorder</CardTitle>
-          <CardDescription>16 kHz / 16-bit PCM WAV — chunked every 5 s</CardDescription>
+          <CardDescription>
+            16 kHz / 16-bit PCM WAV — chunked every 5 s. Each chunk is saved to OPFS before upload,
+            then POSTed to the API for MinIO + Postgres ack.
+          </CardDescription>
+          <div className="flex flex-col gap-1 border-t border-border/40 pt-3 text-xs">
+            <span className="font-medium text-foreground">Recording ID</span>
+            <span className="break-all font-mono text-muted-foreground">{recordingId}</span>
+            <span className="text-muted-foreground">
+              Recorder: <span className="font-mono text-foreground">{status}</span>
+              {" · "}
+              Speech:{" "}
+              <span className="font-mono text-foreground">{transcriptionStatus}</span>
+            </span>
+          </div>
         </CardHeader>
 
         <CardContent className="flex flex-col gap-6">
-          {/* Waveform */}
           <div className="overflow-hidden rounded-sm border border-border/50 bg-muted/20 text-foreground">
             <LiveWaveform
               active={isRecording}
@@ -162,14 +211,11 @@ export default function RecorderPage() {
             />
           </div>
 
-          {/* Timer */}
           <div className="text-center font-mono text-3xl tabular-nums tracking-tight">
             {formatTime(elapsed)}
           </div>
 
-          {/* Controls */}
           <div className="flex items-center justify-center gap-3">
-            {/* Record / Stop */}
             <Button
               size="lg"
               variant={isActive ? "destructive" : "default"}
@@ -190,7 +236,6 @@ export default function RecorderPage() {
               )}
             </Button>
 
-            {/* Pause / Resume */}
             {isActive && (
               <Button
                 size="lg"
@@ -215,7 +260,84 @@ export default function RecorderPage() {
         </CardContent>
       </Card>
 
-      {/* Chunks */}
+      <Card className="w-full">
+        <CardHeader>
+          <CardTitle>Transcript</CardTitle>
+          <CardDescription>
+            Live text from the browser Web Speech API (not the WAV chunks). DeepSeek only formats
+            this text after you stop — no audio is sent to DeepSeek.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          {transcriptionStatus === "unsupported" && (
+            <p className="rounded-sm border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-950 dark:text-amber-100">
+              This browser does not expose speech recognition. Recording and chunk upload still
+              work; only live transcription is unavailable.
+            </p>
+          )}
+          {transcriptionError && transcriptionStatus === "failed" && (
+            <p className="text-sm text-destructive">{transcriptionError}</p>
+          )}
+          <div>
+            <span className="text-xs font-medium text-muted-foreground">Raw (final)</span>
+            <p className="mt-1 min-h-[3rem] whitespace-pre-wrap rounded-sm border border-border/50 bg-muted/20 p-2 text-sm">
+              {rawTranscript || "—"}
+            </p>
+          </div>
+          <div>
+            <span className="text-xs font-medium text-muted-foreground">Interim</span>
+            <p className="mt-1 min-h-[2rem] whitespace-pre-wrap rounded-sm border border-dashed border-border/50 bg-muted/10 p-2 text-sm text-muted-foreground">
+              {interimTranscript || "—"}
+            </p>
+          </div>
+          <div>
+            <span className="text-xs font-medium text-muted-foreground">Cleaned (DeepSeek)</span>
+            <p className="mt-1 min-h-[3rem] whitespace-pre-wrap rounded-sm border border-border/50 bg-muted/20 p-2 text-sm">
+              {cleanedTranscript || "—"}
+            </p>
+            {transcriptCleanedAt && (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Cleaned at {transcriptCleanedAt}
+              </p>
+            )}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              disabled={isCleaning || isActive}
+              onClick={handleCleanTranscript}
+            >
+              {isCleaning ? "Cleaning…" : "Clean transcript"}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="gap-1"
+              onClick={copyCombinedTranscript}
+              disabled={!rawTranscript && !interimTranscript}
+            >
+              <Copy className="size-3" />
+              Copy raw + interim
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="gap-1"
+              onClick={copyCleaned}
+              disabled={!cleanedTranscript}
+            >
+              <Copy className="size-3" />
+              Copy cleaned
+            </Button>
+          </div>
+          {copyHint && <p className="text-xs text-muted-foreground">{copyHint}</p>}
+        </CardContent>
+      </Card>
+
       {chunks.length > 0 && (
         <Card className="w-full">
           <CardHeader className="flex flex-col gap-2">
@@ -227,12 +349,11 @@ export default function RecorderPage() {
                 onClick={handleReconcile}
                 disabled={isReconciling || chunks.length === 0}
               >
-                {isReconciling ? "Reconciling..." : "Reconcile Recording"}
+                {isReconciling ? "Reconciling..." : "Reconcile recording"}
               </Button>
             </div>
             <CardDescription>{chunks.length} recorded</CardDescription>
             <div className="flex flex-col gap-1 text-xs font-mono text-muted-foreground">
-              <span>Recording ID: {recordingId}</span>
               {reconcileMessage && <span>{reconcileMessage}</span>}
             </div>
           </CardHeader>
