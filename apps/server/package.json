@@ -12,6 +12,7 @@
   "dependencies": {
     "@my-better-t-app/db": "*",
     "@my-better-t-app/env": "*",
+    "@aws-sdk/client-s3": "^3.593.0",
     "dotenv": "^17.2.2",
     "hono": "^4.8.2",
     "zod": "^4.1.13"
