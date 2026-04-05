@@ -1,13 +1,14 @@
 import { env } from "@my-better-t-app/env/server";
 import { chunkAcks, db } from "@my-better-t-app/db";
-import { asc, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
+import { TLSSocket } from "node:tls";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
 
-import { uploadChunk } from "./storage";
+import { objectExistsInBucket, uploadChunk } from "./storage";
 
 const app = new Hono();
 
@@ -116,7 +117,16 @@ app.post("/api/chunks/upload", async (c) => {
     .onConflictDoNothing()
     .returning();
 
-  let ackRow = insertResult[0];
+  type ChunkAckSummary = {
+    chunkId: string;
+    sequenceNo: number;
+    objectKey: string;
+    sizeBytes: number;
+    durationMs: number;
+    ackedAt: Date;
+  };
+
+  let ackRow: ChunkAckSummary | undefined = insertResult[0];
   const alreadyExisted = insertResult.length === 0;
 
   if (!ackRow) {
@@ -130,7 +140,7 @@ app.post("/api/chunks/upload", async (c) => {
         ackedAt: chunkAcks.ackedAt,
       })
       .from(chunkAcks)
-      .where(eq(chunkAcks.recordingId, recordingId), eq(chunkAcks.sequenceNo, sequenceNo))
+      .where(and(eq(chunkAcks.recordingId, recordingId), eq(chunkAcks.sequenceNo, sequenceNo)))
       .orderBy(asc(chunkAcks.sequenceNo))
       .limit(1);
 
@@ -187,15 +197,63 @@ app.get("/api/chunks/recordings/:recordingId", async (c) => {
   });
 });
 
+/** DB rows plus HEAD check so the client can repair missing bucket objects. */
+app.get("/api/chunks/recordings/:recordingId/audit", async (c) => {
+  const recordingId = c.req.param("recordingId");
+  if (!recordingId) {
+    return c.json(errorResponse("recordingId is required"), 400);
+  }
+
+  const rows = await db
+    .select({
+      chunkId: chunkAcks.chunkId,
+      sequenceNo: chunkAcks.sequenceNo,
+      objectKey: chunkAcks.objectKey,
+      sizeBytes: chunkAcks.sizeBytes,
+      durationMs: chunkAcks.durationMs,
+      ackedAt: chunkAcks.ackedAt,
+    })
+    .from(chunkAcks)
+    .where(eq(chunkAcks.recordingId, recordingId))
+    .orderBy(asc(chunkAcks.sequenceNo));
+
+  const chunks = await Promise.all(
+    rows.map(async (row) => {
+      let bucketPresent = false;
+      try {
+        bucketPresent = await objectExistsInBucket(row.objectKey);
+      } catch {
+        bucketPresent = false;
+      }
+      return {
+        chunkId: row.chunkId,
+        sequenceNo: row.sequenceNo,
+        objectKey: row.objectKey,
+        sizeBytes: row.sizeBytes,
+        durationMs: row.durationMs,
+        ackedAt: row.ackedAt.toISOString(),
+        bucketPresent,
+      };
+    }),
+  );
+
+  return c.json({
+    ok: true,
+    recordingId,
+    chunks,
+  });
+});
+
 if (import.meta.main) {
   const port = Number(process.env.PORT ?? 3000);
   const server = createServer(async (req, res) => {
     const host = req.headers.host ?? `localhost:${port}`;
-    const protocol = req.socket.encrypted ? "https" : "http";
+    const protocol =
+      req.socket instanceof TLSSocket && req.socket.encrypted ? "https" : "http";
     const pathname = req.url ?? "/";
     const requestInit: RequestInit = {
       method: req.method,
-      headers: req.headers as HeadersInit,
+      headers: req.headers as unknown as Headers,
     };
 
     if (req.method !== "GET" && req.method !== "HEAD") {

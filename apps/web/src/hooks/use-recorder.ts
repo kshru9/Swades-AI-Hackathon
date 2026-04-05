@@ -1,21 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 
+import { readChunkFromOpfs, saveChunkToOpfs } from "@/lib/opfs"
+import { getServerApiBase, uploadChunk } from "@/lib/chunk-upload"
+import type { ChunkStatus, RecorderChunk, ServerAuditResponse } from "@/types/chunks"
+
+export type { RecorderChunk } from "@/types/chunks"
+
 const SAMPLE_RATE = 16000
 const BUFFER_SIZE = 4096
 
-export interface WavChunk {
-  id: string
-  blob: Blob
-  url: string
-  duration: number
-  timestamp: number
-}
-
-export type RecorderStatus = "idle" | "requesting" | "recording" | "paused"
-
-interface UseRecorderOptions {
-  chunkDuration?: number
-  deviceId?: string
+const createRecordingId = () => {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID()
+  }
+  return `recording-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
 function encodeWav(samples: Float32Array, sampleRate: number): Blob {
@@ -65,31 +63,43 @@ function resample(input: Float32Array, fromRate: number, toRate: number): Float3
   return output
 }
 
+export interface UseRecorderOptions {
+  chunkDuration?: number
+  deviceId?: string
+}
+
+export type RecorderStatus = "idle" | "requesting" | "recording" | "paused"
+
 export function useRecorder(options: UseRecorderOptions = {}) {
   const { chunkDuration = 5, deviceId } = options
 
   const [status, setStatus] = useState<RecorderStatus>("idle")
-  const [chunks, setChunks] = useState<WavChunk[]>([])
+  const [chunks, setChunks] = useState<RecorderChunk[]>([])
   const [elapsed, setElapsed] = useState(0)
   const [stream, setStream] = useState<MediaStream | null>(null)
+  const [recordingId, setRecordingId] = useState(() => createRecordingId())
 
   const streamRef = useRef<MediaStream | null>(null)
   const audioCtxRef = useRef<AudioContext | null>(null)
   const processorRef = useRef<ScriptProcessorNode | null>(null)
   const samplesRef = useRef<Float32Array[]>([])
   const sampleCountRef = useRef(0)
+  const chunkSequenceRef = useRef(0)
   const chunkThreshold = SAMPLE_RATE * chunkDuration
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const startTimeRef = useRef(0)
   const pausedElapsedRef = useRef(0)
   const statusRef = useRef<RecorderStatus>("idle")
+  const pendingUploadsRef = useRef<RecorderChunk[]>([])
+  const uploadingRef = useRef(false)
+  const chunksRef = useRef<RecorderChunk[]>([])
 
   statusRef.current = status
+  chunksRef.current = chunks
 
-  const flushChunk = useCallback(() => {
-    if (samplesRef.current.length === 0) return
-
-    const totalLen = samplesRef.current.reduce((n, b) => n + b.length, 0)
+  const mergeBufferedSamples = useCallback(() => {
+    const totalLen = samplesRef.current.reduce((len, buf) => len + buf.length, 0)
+    if (totalLen === 0) return null
     const merged = new Float32Array(totalLen)
     let offset = 0
     for (const buf of samplesRef.current) {
@@ -98,18 +108,154 @@ export function useRecorder(options: UseRecorderOptions = {}) {
     }
     samplesRef.current = []
     sampleCountRef.current = 0
-
-    const blob = encodeWav(merged, SAMPLE_RATE)
-    const url = URL.createObjectURL(blob)
-    const chunk: WavChunk = {
-      id: crypto.randomUUID(),
-      blob,
-      url,
-      duration: merged.length / SAMPLE_RATE,
-      timestamp: Date.now(),
-    }
-    setChunks((prev) => [...prev, chunk])
+    return merged
   }, [])
+
+  const updateChunkState = useCallback(
+    (chunkId: string, patch: Partial<RecorderChunk>) => {
+      setChunks((prev) =>
+        prev.map((chunk) => (chunk.chunkId === chunkId ? { ...chunk, ...patch } : chunk))
+      )
+    },
+    []
+  )
+
+  const uploadChunkInternal = useCallback(
+    async (chunk: RecorderChunk) => {
+      updateChunkState(chunk.chunkId, { status: "uploading", error: undefined })
+      try {
+        const result = await uploadChunk({
+          recordingId: chunk.recordingId,
+          chunkId: chunk.chunkId,
+          sequenceNo: chunk.sequenceNo,
+          durationMs: chunk.durationMs,
+          blob: chunk.blob,
+        })
+        updateChunkState(chunk.chunkId, {
+          status: (result.ackedAt ? "acked" : "uploaded") as ChunkStatus,
+          uploadedAt: new Date().toISOString(),
+          ackedAt: result.ackedAt,
+          sizeBytes: result.sizeBytes,
+          error: undefined,
+        })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        updateChunkState(chunk.chunkId, { status: "failed", error: message })
+      }
+    },
+    [updateChunkState]
+  )
+
+  const runUploadQueue = useCallback(async () => {
+    if (uploadingRef.current) return
+    uploadingRef.current = true
+    try {
+      while (pendingUploadsRef.current.length > 0) {
+        const next = pendingUploadsRef.current.shift()
+        if (!next) continue
+        await uploadChunkInternal(next)
+      }
+    } finally {
+      uploadingRef.current = false
+    }
+  }, [uploadChunkInternal])
+
+  const enqueueUpload = useCallback(
+    (chunk: RecorderChunk) => {
+      pendingUploadsRef.current.push(chunk)
+      void runUploadQueue()
+    },
+    [runUploadQueue]
+  )
+
+  const handleBufferedChunk = useCallback(
+    async (samples: Float32Array) => {
+      if (!recordingId) return
+      const sequenceNo = chunkSequenceRef.current + 1
+      chunkSequenceRef.current = sequenceNo
+      const chunkId = `${recordingId}-${String(sequenceNo).padStart(4, "0")}`
+      const durationSeconds = samples.length / SAMPLE_RATE
+      const durationMs = Math.round(durationSeconds * 1000)
+      const blob = encodeWav(samples, SAMPLE_RATE)
+      const url = URL.createObjectURL(blob)
+
+      const baseChunk: RecorderChunk = {
+        chunkId,
+        recordingId,
+        sequenceNo,
+        blob,
+        url,
+        duration: durationSeconds,
+        durationMs,
+        timestamp: Date.now(),
+        sizeBytes: blob.size,
+        status: "local_saved",
+      }
+
+      let localOpfsPath: string | undefined
+      try {
+        localOpfsPath = await saveChunkToOpfs(recordingId, sequenceNo, chunkId, blob)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        setChunks((prev) => [
+          ...prev,
+          { ...baseChunk, status: "failed", error: `OPFS save failed: ${message}` },
+        ])
+        return
+      }
+
+      const savedChunk: RecorderChunk = { ...baseChunk, localOpfsPath }
+      setChunks((prev) => [...prev, savedChunk])
+      enqueueUpload(savedChunk)
+    },
+    [enqueueUpload, recordingId]
+  )
+
+  const flushChunk = useCallback(async () => {
+    const merged = mergeBufferedSamples()
+    if (!merged) return
+    await handleBufferedChunk(merged)
+  }, [handleBufferedChunk, mergeBufferedSamples])
+
+  const reconcileRecording = useCallback(async () => {
+    if (!recordingId) return
+    const res = await fetch(
+      `${getServerApiBase()}/api/chunks/recordings/${recordingId}/audit`
+    )
+    const body = (await res.json()) as ServerAuditResponse | { ok?: false; error?: string }
+    if (!res.ok || !("chunks" in body) || body.ok !== true) {
+      const detail = "error" in body && body.error ? body.error : JSON.stringify(body)
+      throw new Error(`reconcile failed: ${detail}`)
+    }
+    const bySeq = new Map(body.chunks.map((row) => [row.sequenceNo, row]))
+    for (const chunk of chunksRef.current) {
+      const row = bySeq.get(chunk.sequenceNo)
+      const serverAndBucketOk = row?.bucketPresent === true
+      if (serverAndBucketOk) continue
+
+      updateChunkState(chunk.chunkId, { status: "needs_repair", error: undefined })
+      try {
+        const opfsBlob = await readChunkFromOpfs(recordingId, chunk.sequenceNo, chunk.chunkId)
+        const result = await uploadChunk({
+          recordingId,
+          chunkId: chunk.chunkId,
+          sequenceNo: chunk.sequenceNo,
+          durationMs: chunk.durationMs,
+          blob: opfsBlob,
+        })
+        updateChunkState(chunk.chunkId, {
+          status: "repaired",
+          uploadedAt: new Date().toISOString(),
+          ackedAt: result.ackedAt,
+          sizeBytes: result.sizeBytes,
+          error: undefined,
+        })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        updateChunkState(chunk.chunkId, { status: "failed", error: message })
+      }
+    }
+  }, [recordingId, updateChunkState])
 
   const start = useCallback(async () => {
     if (statusRef.current === "recording") return
@@ -137,27 +283,8 @@ export function useRecorder(options: UseRecorderOptions = {}) {
         sampleCountRef.current += resampled.length
 
         if (sampleCountRef.current >= chunkThreshold) {
-          // flush synchronously from the collected buffers
-          const totalLen = samplesRef.current.reduce((n, b) => n + b.length, 0)
-          const merged = new Float32Array(totalLen)
-          let off = 0
-          for (const buf of samplesRef.current) {
-            merged.set(buf, off)
-            off += buf.length
-          }
-          samplesRef.current = []
-          sampleCountRef.current = 0
-
-          const blob = encodeWav(merged, SAMPLE_RATE)
-          const url = URL.createObjectURL(blob)
-          const chunk: WavChunk = {
-            id: crypto.randomUUID(),
-            blob,
-            url,
-            duration: merged.length / SAMPLE_RATE,
-            timestamp: Date.now(),
-          }
-          setChunks((prev) => [...prev, chunk])
+          const merged = mergeBufferedSamples()
+          if (merged) void handleBufferedChunk(merged)
         }
       }
 
@@ -178,18 +305,16 @@ export function useRecorder(options: UseRecorderOptions = {}) {
 
       timerRef.current = setInterval(() => {
         if (statusRef.current === "recording") {
-          setElapsed(
-            pausedElapsedRef.current + (Date.now() - startTimeRef.current) / 1000
-          )
+          setElapsed(pausedElapsedRef.current + (Date.now() - startTimeRef.current) / 1000)
         }
       }, 100)
     } catch {
       setStatus("idle")
     }
-  }, [deviceId, chunkThreshold])
+  }, [chunkThreshold, deviceId, handleBufferedChunk, mergeBufferedSamples])
 
   const stop = useCallback(() => {
-    flushChunk()
+    void flushChunk()
 
     processorRef.current?.disconnect()
     streamRef.current?.getTracks().forEach((t) => t.stop())
@@ -218,11 +343,16 @@ export function useRecorder(options: UseRecorderOptions = {}) {
   }, [])
 
   const clearChunks = useCallback(() => {
-    for (const c of chunks) URL.revokeObjectURL(c.url)
+    for (const chunk of chunks) {
+      URL.revokeObjectURL(chunk.url)
+    }
     setChunks([])
+    chunkSequenceRef.current = 0
+    pendingUploadsRef.current = []
+    uploadingRef.current = false
+    setRecordingId(createRecordingId())
   }, [chunks])
 
-  // cleanup on unmount
   useEffect(() => {
     return () => {
       processorRef.current?.disconnect()
@@ -234,5 +364,17 @@ export function useRecorder(options: UseRecorderOptions = {}) {
     }
   }, [])
 
-  return { status, start, stop, pause, resume, chunks, elapsed, stream, clearChunks }
+  return {
+    status,
+    start,
+    stop,
+    pause,
+    resume,
+    chunks,
+    elapsed,
+    stream,
+    clearChunks,
+    recordingId,
+    reconcileRecording,
+  }
 }
